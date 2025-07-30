@@ -4,44 +4,35 @@ const fs = require('fs');
 const proxyURLs = [
   'https://api.proxyscrape.com/?request=displayproxies&proxytype=http',
   'https://proxyspace.pro/http.txt'
-  // Tambahkan URL tambahan jika perlu
+  // Add more URLs here as needed
 ];
 
 const proxyFile = 'proxy.txt';
 
 async function downloadProxiesFromURL(url) {
   try {
-    const response = await axios.get(url, { timeout: 10000 });
-    return response.data;
+    const response = await axios.get(url);
+    const proxies = response.data;
+    return proxies;
   } catch (error) {
-    console.error(`❌ Error downloading from ${url}:`, error.message);
+    console.error(`Error downloading proxies from ${url}:`, error);
     return '';
   }
 }
 
-function filterValidProxies(data) {
-  const lines = data.split(/\r?\n/);
-  const valid = lines.filter(line =>
-    /^\\d{1,3}(\\.\\d{1,3}){3}:\\d{2,5}$/.test(line.trim())
-  );
-  return valid;
-}
-
 async function downloadProxies() {
-  let proxySet = new Set();
+  let allProxies = '';
 
   for (const url of proxyURLs) {
-    const rawData = await downloadProxiesFromURL(url);
-    const validProxies = filterValidProxies(rawData);
-    validProxies.forEach(proxy => proxySet.add(proxy));
+    const proxies = await downloadProxiesFromURL(url);
+    allProxies += proxies + '\n';
   }
 
-  const finalList = Array.from(proxySet).join('\n');
-  if (finalList) {
-    fs.writeFileSync(proxyFile, finalList, 'utf-8');
-    console.log(`✅ ${proxySet.size} proxies saved to ${proxyFile}`);
+  if (allProxies) {
+    fs.writeFileSync(proxyFile, allProxies, { flag: 'w' });
+    console.log(`Proxies written to ${proxyFile}`);
   } else {
-    console.error('⚠️ No valid proxies found.');
+    console.error('No proxies were downloaded.');
   }
 }
 
